@@ -1,5 +1,5 @@
 #!/bin/sh
-# wifi-picker.sh — POSIX-only Wi-Fi picker using nmcli
+# wifi.sh — POSIX-only Wi-Fi picker using nmcli
 # Works in /bin/sh (dash). No bash features required.
 
 set -eu
