@@ -1,9 +1,10 @@
 #!/bin/sh
 # wifi — SSID/Band/Signal picker for terminals
 # - nmcli 1.52-safe parsing (SSIDs with colons, FREQ like "#### MHz")
-# - Sorted table (Signal desc)
+# - Shows current connection in a "Now" column
+# - Sorts by SSID (A→Z), then by Signal (desc) within the same SSID
 # - SSID-first connect (avoids brcmfmac channel-set errors), optional BSSID fallback
-# - Explicit security profiles to avoid "key-mgmt missing" on some setups
+# - Explicit security profiles to avoid "key-mgmt missing" errors
 
 set -eu
 export LC_ALL=C
@@ -39,7 +40,6 @@ is_uint(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 band_of_freq(){
   f="$1"; is_uint "$f" || { echo "?"; return; }
   [ "$f" -ge 2400 ] && [ "$f" -le 2500 ] && { echo "2.4"; return; }
-  # 5 GHz includes UNII bands; upper bound covers common values
   [ "$f" -ge 4900 ] && [ "$f" -le 5895 ] && { echo "5"; return; }
   [ "$f" -ge 5925 ] && [ "$f" -le 7125 ] && { echo "6"; return; }
   echo "?"
@@ -48,34 +48,36 @@ band_of_freq(){
 sanitize_bssid(){ printf "%s" "$1" | tr -cd '0-9A-Fa-f:'; }
 
 scan_networks(){
-  # nmcli terse: SSID:BSSID:FREQ:SIGNAL:SECURITY
-  # BSSID = 6 octets with colons; SSID can contain escaped "\:"; FREQ may be "#### MHz"
-  nmcli -t -f SSID,BSSID,FREQ,SIGNAL,SECURITY device wifi list ifname "$IFACE" \
+  # Include IN-USE so we can show the active row.
+  # Fields: IN-USE:SSID:BSSID:FREQ:SIGNAL:SECURITY
+  # BSSID = 6 octets with colons; SSID may contain escaped "\:"; FREQ may be "#### MHz".
+  nmcli -t -f IN-USE,SSID,BSSID,FREQ,SIGNAL,SECURITY device wifi list ifname "$IFACE" \
   | awk -F: '
     {
       n = NF
-      # min: SSID(>=1) + BSSID(6) + FREQ(1) + SIGNAL(1) + SECURITY(1) = 10 fields
-      if (n < 10) next
+      # min: IN-USE(1) + SSID(>=1) + BSSID(6) + FREQ(1) + SIGNAL(1) + SECURITY(1) = 11 fields
+      if (n < 11) next
 
-      security = $n
-      signal   = $(n-1)
-      freq     = $(n-2)
-      bssid    = $(n-8) ":" $(n-7) ":" $(n-6) ":" $(n-5) ":" $(n-4) ":" $(n-3)
+      inuse   = $1
+      security= $n
+      signal  = $(n-1)
+      freq    = $(n-2)
+      bssid   = $(n-8) ":" $(n-7) ":" $(n-6) ":" $(n-5) ":" $(n-4) ":" $(n-3)
 
-      ssid = $1
-      for (i = 2; i <= n-9; i++) ssid = ssid ":" $i
+      ssid = $2
+      for (i = 3; i <= n-9; i++) ssid = ssid ":" $i
 
       gsub(/\\:/, ":", ssid)  # unescape literal colons
 
       if (length(ssid) > 0) {
-        printf "%s|%s|%s|%s|%s\n", ssid, bssid, freq, signal, security
+        printf "%s|%s|%s|%s|%s|%s\n", inuse, ssid, bssid, freq, signal, security
       }
     }
   ' >"$TMP"
 
-  # Sort by SIGNAL desc; stable by SSID then BSSID
+  # Sort by SSID asc (col 2), then by SIGNAL desc (col 5), then by BSSID
   if [ -s "$TMP" ]; then
-    sort -t'|' -k4,4nr -k1,1 -k2,2 "$TMP" > "$TMP_SORT" || cp "$TMP" "$TMP_SORT"
+    sort -t'|' -k2,2f -k5,5nr -k3,3 "$TMP" > "$TMP_SORT" || cp "$TMP" "$TMP_SORT"
   else
     : > "$TMP_SORT"
   fi
@@ -84,21 +86,38 @@ scan_networks(){
 print_menu(){
   echo
   printf "Interface: %s\n\n" "$IFACE"
-  printf "%-4s %-32s %-4s %s\n" "#" "SSID" "Band" "Signal"
-  printf "%-4s %-32s %-4s %s\n" "----" "--------------------------------" "----" "------"
-  i=0
-  while IFS='|' read -r ssid bssid freq signal security; do
-    i=$((i+1))
+  printf "%-3s %-32s %-4s %s\n" "Now" "SSID" "Band" "Signal"
+  printf "%-3s %-32s %-4s %s\n" "---" "--------------------------------" "----" "------"
+  while IFS='|' read -r inuse ssid bssid freq signal security; do
     freq_digits=$(printf "%s" "${freq:-}"   | tr -cd '0-9')
     sig_digits=$( printf "%s" "${signal:-}" | tr -cd '0-9')
     [ -n "$sig_digits" ] || sig_digits="0"
     band="$(band_of_freq "${freq_digits:-0}")"
     ssid_disp=$(printf "%s" "$ssid" | cut -c1-32)
-    printf "%-4s %-32s %-4s %s\n" "$i" "$ssid_disp" "$band" "$sig_digits"
+    now="$( [ "$inuse" = "*" ] && printf "*" || printf " " )"
+    printf "%-3s %-32s %-4s %s\n" "$now" "$ssid_disp" "$band" "$sig_digits"
   done <"$TMP_SORT"
+
+  echo
+  # Reprint with indices for selection (kept simple and readable)
+  echo "Pick a number to connect (SSID-first; explicit security; BSSID fallback if safe)."
+  echo
+  printf "%-4s %-32s %-4s %s\n" "#" "SSID" "Band" "Signal"
+  printf "%-4s %-32s %-4s %s\n" "----" "--------------------------------" "----" "------"
+  nl -ba "$TMP_SORT" | while IFS=$'\t' read -r idx row; do
+    IFS='|' read -r inuse ssid bssid freq signal security <<EOF
+$row
+EOF
+    freq_digits=$(printf "%s" "${freq:-}"   | tr -cd '0-9')
+    sig_digits=$( printf "%s" "${signal:-}" | tr -cd '0-9')
+    [ -n "$sig_digits" ] || sig_digits="0"
+    band="$(band_of_freq "${freq_digits:-0}")"
+    ssid_disp=$(printf "%s" "$ssid" | cut -c1-32)
+    printf "%-4s %-32s %-4s %s\n" "$idx" "$ssid_disp" "$band" "$sig_digits"
+  done
+
   echo
   echo "[C] Connect (hidden SSID)   [D] Disconnect current   [R] Rescan   [Q] Quit"
-  echo "Pick a number to connect (SSID-first; explicit security; BSSID fallback if safe)."
 }
 
 disconnect_now(){
@@ -123,8 +142,6 @@ connect_via_profile(){
   nmcli -t -f NAME connection show 2>/dev/null | awk -F: -v n="$_conn" '$1==n{print $1}' \
     | while read -r old; do nmcli connection delete id "$old" >/dev/null 2>&1 || true; done
 
-  # Determine key-mgmt from SECURITY column
-  # SECURITY examples: "--" (open), "WPA2", "WPA3", "WPA2 WPA3", "SAE", "WEP", "OWE"
   case " $_sec " in
     *" -- "*)  # Open
       nmcli -w 20 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" >/dev/null
@@ -140,12 +157,10 @@ connect_via_profile(){
         802-11-wireless-security.wep-key0 "$_pass" \
         802-11-wireless-security.wep-key-type key >/dev/null
       ;;
-    *" SAE "*|*" WPA3 "*)  # WPA3-Personal
+    *" SAE "*|*" WPA3 "*)  # WPA3-Personal / SAE
       if [ "$SUPPORTS_ASK" -eq 1 ]; then
-        # Let NM prompt for SAE vs mixed; still set sae first
         nmcli -w 30 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" \
           802-11-wireless-security.key-mgmt sae >/dev/null
-        echo "(Credential prompt may appear in TTY)"
         nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
         # Fallback to PSK for mixed WPA2/3
         nmcli connection modify "$_conn" 802-11-wireless-security.key-mgmt wpa-psk >/dev/null
@@ -162,14 +177,13 @@ connect_via_profile(){
           802-11-wireless-security.key-mgmt sae \
           802-11-wireless-security.psk "$_pass" >/dev/null || true
         nmcli -w 30 connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
-        # Fallback to PSK
         nmcli connection modify "$_conn" 802-11-wireless-security.key-mgmt wpa-psk >/dev/null
         nmcli -w 30 connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
         nmcli connection delete id "$_conn" >/dev/null 2>&1 || true
         return 1
       fi
       ;;
-    *" OWE "*) # Enhanced Open (OWE) — no password but key-mgmt=owe
+    *" OWE "*) # Enhanced Open (OWE)
       nmcli -w 20 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" \
         802-11-wireless-security.key-mgmt owe >/dev/null
       ;;
@@ -177,7 +191,6 @@ connect_via_profile(){
       if [ "$SUPPORTS_ASK" -eq 1 ]; then
         nmcli -w 20 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" \
           802-11-wireless-security.key-mgmt wpa-psk >/dev/null
-        echo "(Credential prompt may appear in TTY)"
         nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
         nmcli connection delete id "$_conn" >/dev/null 2>&1 || true
         return 1
@@ -194,15 +207,14 @@ connect_via_profile(){
       ;;
   esac
 
-  # Bring it up (SSID-first). If BSSID provided (and allowed), pass as AP hint.
   nmcli -w 45 connection up id "$_conn" ${_bssid:+ap "$_bssid"} >/dev/null
 }
 
 connect_to_row(){
   row="$1"
-  ssid=$(     printf "%s" "$row" | awk -F'|' '{print $1}')
-  bssid=$(    printf "%s" "$row" | awk -F'|' '{print $2}')
-  security=$( printf "%s" "$row" | awk -F'|' '{print $5}')
+  ssid=$(     printf "%s" "$row" | awk -F'|' '{print $2}')
+  bssid=$(    printf "%s" "$row" | awk -F'|' '{print $3}')
+  security=$( printf "%s" "$row" | awk -F'|' '{print $6}')
   sbssid="$(sanitize_bssid "$bssid")"
 
   echo
@@ -211,14 +223,16 @@ connect_to_row(){
 
   # 1) SSID-first with explicit profile (no AP hint)
   if connect_via_profile "$ssid" "$security" ""; then
-    echo "✅ Connected (SSID)."; return 0
+    echo "✅ Connected to \"$ssid\"."
+    exit 0
   fi
 
-  # 2) Optional BSSID fallback if not on brcmfmac (channel forcing can fail on Pi)
+  # 2) Optional BSSID fallback if not on brcmfmac
   if [ "$TRY_BSSID" -eq 1 ] && [ -n "$sbssid" ]; then
     echo "…Retrying with BSSID hint."
     if connect_via_profile "$ssid" "$security" "$sbssid"; then
-      echo "✅ Connected (BSSID)."; return 0
+      echo "✅ Connected to \"$ssid\" (BSSID)."
+      exit 0
     fi
   fi
 
@@ -246,16 +260,17 @@ while :; do
       printf "Enter SSID (exact): "; IFS= read -r manual_ssid
       [ -z "$manual_ssid" ] && continue
       # Probe security for manual SSID by scanning and exact match (first hit)
-      manual_row="$(grep -m1 -F "^$manual_ssid|" "$TMP_SORT" || true)"
+      manual_row="$(grep -m1 -F "|$manual_ssid|" "$TMP_SORT" || true)"
       sec_guess="WPA2"
       if [ -n "$manual_row" ]; then
-        sec_guess="$(printf "%s" "$manual_row" | awk -F'|' '{print $5}')"
+        sec_guess="$(printf "%s" "$manual_row" | awk -F'|' '{print $6}')"
       fi
-      echo "Connecting to hidden/typed SSID: $manual_ssid (security: $sec_guess)"
+      echo "Connecting to \"$manual_ssid\" (security: $sec_guess)..."
       if connect_via_profile "$manual_ssid" "$sec_guess" ""; then
-        echo "✅ Connected."
+        echo "✅ Connected to \"$manual_ssid\"."
+        exit 0
       else
-        echo "Hidden SSID connect failed."
+        echo "Hidden/typed SSID connect failed."
       fi
       printf "Press Enter to continue…"; IFS= read -r _ ;;
     *)
