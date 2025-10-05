@@ -1,13 +1,18 @@
 #!/bin/sh
-# wifi.sh — POSIX Wi-Fi picker with BSSID/Band/Channel (safe on weird FREQ)
+# wifi.sh — POSIX Wi-Fi picker with SSID, Band, Signal (numeric)
+# - Uses nmcli with a custom separator to avoid ':' escaping issues
+# - Sanitizes BSSID before connect; falls back to SSID-only if needed
+
 set -eu
 
 err() { printf >&2 "Error: %s\n" "$*"; exit 1; }
-command -v nmcli >/dev/null 2>&1 || err "nmcli not found. Install network-manager."
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# First wifi iface managed by NM
+have nmcli || err "nmcli not found. Install network-manager."
+
+# Find first Wi-Fi interface managed by NetworkManager
 IFACE="$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi"{print $1; exit}')"
-[ -n "${IFACE:-}" ] || err "No Wi-Fi interface of TYPE=wifi found."
+[ -n "${IFACE:-}" ] || err "No Wi-Fi interface (TYPE=wifi) found."
 nmcli radio wifi on >/dev/null 2>&1 || true
 
 TMP="${TMPDIR:-/tmp}/wifi_scan.$$"
@@ -18,39 +23,46 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac }
 band_of_freq() {
   f="$1"
   is_uint "$f" || { echo "?"; return; }
-  # ranges in MHz
-  if [ "$f" -ge 2400 ] && [ "$f" -le 2500 ]; then echo "2.4"; return; fi
-  if [ "$f" -ge 4900 ] && [ "$f" -le 5895 ]; then echo "5";   return; fi
-  if [ "$f" -ge 5925 ] && [ "$f" -le 7125 ]; then echo "6";   return; fi
+  # MHz ranges
+  [ "$f" -ge 2400 ] && [ "$f" -le 2500 ] && { echo "2.4"; return; }
+  [ "$f" -ge 4900 ] && [ "$f" -le 5895 ] && { echo "5";   return; }
+  [ "$f" -ge 5925 ] && [ "$f" -le 7125 ] && { echo "6";   return; }
   echo "?"
 }
 
+sanitize_bssid() {
+  # Keep only hex digits and colons
+  printf "%s" "$1" | tr -cd '0-9A-Fa-f:'
+}
+
 scan_networks() {
-  # IN-USE:SSID:BSSID:FREQ:CHAN:SECURITY:SIGNAL
-  nmcli -t -f IN-USE,SSID,BSSID,FREQ,CHAN,SECURITY,SIGNAL device wifi list ifname "$IFACE" \
-    | awk -F: 'length($2)>0 {print $0}' >"$TMP"
+  # Use a safe separator so colons inside fields don't split rows.
+  # Fields: SSID|BSSID|FREQ|SIGNAL|SECURITY|IN-USE
+  nmcli -t --escape yes --separator '|' \
+    -f SSID,BSSID,FREQ,SIGNAL,SECURITY,IN-USE \
+    device wifi list ifname "$IFACE" \
+    | awk -F'|' 'length($1)>0' >"$TMP"
 }
 
 print_menu() {
   echo
   printf "Interface: %s\n\n" "$IFACE"
-  printf "%-4s %-1s %-28s %-17s %-4s %-4s %-12s %s\n" "#" "*" "SSID" "BSSID" "Band" "Ch" "SECURITY" "SIGNAL"
-  printf "%-4s %-1s %-28s %-17s %-4s %-4s %-12s %s\n" "----" "-" "----------------------------" "-----------------" "----" "----" "------------" "------"
+  printf "%-4s %-32s %-4s %s\n" "#" "SSID" "Band" "Signal"
+  printf "%-4s %-32s %-4s %s\n" "----" "--------------------------------" "----" "------"
   i=0
-  while IFS=: read -r inuse ssid bssid freq chan sec sig; do
+  while IFS='|' read -r ssid bssid freq signal sec inuse; do
     i=$((i+1))
-    [ -n "${sec:-}" ]  || sec="--"
-    [ -n "${sig:-}" ]  || sig="0"
-    [ -n "${chan:-}" ] || chan="--"
-    [ -n "${freq:-}" ] || freq="0"
-    star=""; [ "$inuse" = "*" ] && star="*"
-    band="$(band_of_freq "$freq")"
-    ssid_disp=$(printf "%s" "$ssid" | cut -c1-28)
-    printf "%-4s %-1s %-28s %-17s %-4s %-4s %-12s %s\n" "$i" "$star" "$ssid_disp" "$bssid" "$band" "$chan" "$sec" "$sig"
+    # Normalize fields
+    freq_digits=$(printf "%s" "${freq:-}"   | tr -cd '0-9')
+    sig_digits=$( printf "%s" "${signal:-}" | tr -cd '0-9')
+    [ -n "$sig_digits" ] || sig_digits="0"
+    band="$(band_of_freq "${freq_digits:-0}")"
+    ssid_disp=$(printf "%s" "$ssid" | cut -c1-32)
+    printf "%-4s %-32s %-4s %s\n" "$i" "$ssid_disp" "$band" "$sig_digits"
   done <"$TMP"
   echo
   echo "[C] Connect (hidden SSID)   [D] Disconnect current   [R] Rescan   [Q] Quit"
-  echo "Pick a number to connect to that exact AP (by BSSID)."
+  echo "Pick a number to connect (tries exact AP, falls back to SSID)."
 }
 
 disconnect_now() {
@@ -65,25 +77,44 @@ disconnect_now() {
   fi
 }
 
-connect_to() {
-  ssid="$1"; bssid="$2"; sec="$3"
+connect_to_row() {
+  row="$1"
+  # Parse the row again using the same delimiter
+  ssid=$(  printf "%s" "$row" | awk -F'|' '{print $1}')
+  bssid=$( printf "%s" "$row" | awk -F'|' '{print $2}')
+  sec=$(   printf "%s" "$row" | awk -F'|' '{print $5}')
+  sbssid="$(sanitize_bssid "$bssid")"
+
   echo
-  echo "Connecting to SSID: $ssid (AP $bssid)"
-  if [ "$sec" = "--" ] || [ "$sec" = "NONE" ]; then
-    nmcli device wifi connect "$ssid" ifname "$IFACE" bssid "$bssid" || err "Connect failed."
-  else
-    if ! nmcli -w 10 device wifi connect "$ssid" ifname "$IFACE" bssid "$bssid" >/dev/null 2>&1; then
-      printf "Wi-Fi password for \"%s\": " "$ssid" >/dev/tty
-      stty -echo </dev/tty 2>/dev/null || true
-      IFS= read -r pass </dev/tty || pass=""
-      stty echo </dev/tty 2>/dev/null || true
-      echo
-      nmcli device wifi connect "$ssid" ifname "$IFACE" bssid "$bssid" password "$pass" || err "Connect failed."
+  echo "Connecting to SSID: $ssid"
+
+  if [ -n "$sbssid" ]; then
+    echo "Trying AP (BSSID): $sbssid"
+    if nmcli -w 10 device wifi connect "$ssid" ifname "$IFACE" bssid "$sbssid" >/dev/null 2>&1; then
+      echo "✅ Connected (by BSSID)."
+      return 0
+    else
+      echo "…BSSID connect failed, falling back to SSID only."
     fi
   fi
+
+  # SSID-only (let NM choose the best AP). Prompt for pass only if needed.
+  if nmcli -w 10 device wifi connect "$ssid" ifname "$IFACE" >/dev/null 2>&1; then
+    echo "✅ Connected (by SSID)."
+    return 0
+  fi
+
+  # Prompt for password and retry SSID-only
+  printf "Wi-Fi password for \"%s\": " "$ssid" >/dev/tty
+  stty -echo </dev/tty 2>/dev/null || true
+  IFS= read -r pass </dev/tty || pass=""
+  stty echo </dev/tty 2>/dev/null || true
+  echo
+  nmcli device wifi connect "$ssid" ifname "$IFACE" password "$pass" || err "Connect failed."
   echo "✅ Connected."
 }
 
+# ---------- Main loop ----------
 while :; do
   scan_networks
   if [ ! -s "$TMP" ]; then
@@ -103,27 +134,25 @@ while :; do
     c)
       printf "Enter SSID (exact, case-sensitive): "; IFS= read -r manual_ssid
       [ -z "$manual_ssid" ] && continue
-      printf "Security (press Enter if unknown): "; IFS= read -r sec_hint
-      [ -z "$sec_hint" ] && sec_hint="WPA-PSK"
       echo "Connecting to hidden SSID: $manual_ssid"
-      if ! nmcli -w 10 device wifi connect "$manual_ssid" ifname "$IFACE" >/dev/null 2>&1; then
+      if nmcli -w 10 device wifi connect "$manual_ssid" ifname "$IFACE" >/dev/null 2>&1; then
+        echo "✅ Connected."
+      else
         printf "Wi-Fi password for \"%s\": " "$manual_ssid" >/dev/tty
         stty -echo </dev/tty 2>/dev/null || true
         IFS= read -r pass </dev/tty || pass=""
         stty echo </dev/tty 2>/dev/null || true
         echo
         nmcli device wifi connect "$manual_ssid" ifname "$IFACE" password "$pass" || err "Connect failed."
+        echo "✅ Connected."
       fi
-      echo "✅ Connected."
       printf "Press Enter to continue…"; IFS= read -r _ ;;
     *)
       case "$choice" in *[!0-9]*|"") echo "Invalid choice."; sleep 1; continue ;; esac
+      # Fetch the Nth line from the scan results and pass it to connect
       sel="$(nl -ba "$TMP" | awk -v n="$choice" '$1==n{ $1=""; sub(/^ *\t?/,""); print; exit }')"
       [ -n "${sel:-}" ] || { echo "Invalid number."; sleep 1; continue; }
-      ssid=$( printf "%s" "$sel" | awk -F: '{print $2}')
-      bssid=$(printf "%s" "$sel" | awk -F: '{print $3}')
-      sec=$(  printf "%s" "$sel" | awk -F: '{print $6}'); [ -n "$sec" ] || sec="--"
-      connect_to "$ssid" "$bssid" "$sec"
+      connect_to_row "$sel"
       printf "Press Enter to continue…"; IFS= read -r _ ;;
   esac
 done
