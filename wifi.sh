@@ -2,6 +2,7 @@
 # wifi — SSID/Band/Signal picker; robust parsing for old nmcli, SSIDs with colons; BSSID fallback
 
 set -eu
+export LC_ALL=C
 
 err() { printf >&2 "Error: %s\n" "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -13,7 +14,8 @@ IFACE="$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi"{print $1; e
 nmcli radio wifi on >/dev/null 2>&1 || true
 
 TMP="${TMPDIR:-/tmp}/wifi_scan.$$"
-trap 'rm -f "$TMP"' EXIT INT HUP TERM
+TMP_SORT="${TMPDIR:-/tmp}/wifi_scan_sorted.$$"
+trap 'rm -f "$TMP" "$TMP_SORT"' EXIT INT HUP TERM
 
 is_uint(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 
@@ -28,21 +30,26 @@ band_of_freq(){
 sanitize_bssid(){ printf "%s" "$1" | tr -cd '0-9A-Fa-f:'; }
 
 scan_networks(){
-  # nmcli prints: SSID:BSSID:FREQ:SIGNAL (but SSID may contain \:)
-  # Reparse from the end into SSID|BSSID|FREQ|SIGNAL, skip empty SSIDs.
+  # We MUST NOT split on ":" naïvely because BSSID contains colons.
+  # Use a regex: SSID : BSSID(17 chars) : FREQ(digits) : SIGNAL(digits)
   nmcli -t -f SSID,BSSID,FREQ,SIGNAL device wifi list ifname "$IFACE" \
-  | awk -F: '
-    {
-      n=split($0,a,":");
-      signal=a[n];
-      freq=a[n-1];
-      bssid=a[n-2];
-      ssid=a[1];
-      for(i=2;i<=n-3;i++){ ssid=ssid ":" a[i] }   # rebuild SSID (may include \:)
-      if (length(ssid)>0) {
-        print ssid "|" bssid "|" freq "|" signal
+  | awk '
+      match($0, /^(.*):([0-9A-Fa-f:]{17}):([0-9]+):([0-9]+)$/, m) {
+        ssid = m[1]; bssid = m[2]; freq = m[3]; signal = m[4];
+        gsub(/\\:/, ":", ssid);    # unescape literal colons in SSID
+        if (length(ssid) > 0) {
+          printf "%s|%s|%s|%s\n", ssid, bssid, freq, signal
+        }
       }
-    }' >"$TMP"
+    ' >"$TMP"
+
+  # Sort by SIGNAL desc (numeric). keep stable order on ties by SSID then BSSID
+  # -t'|' sets delimiter; -k4,4n numeric; 'r' reverse for descending
+  if [ -s "$TMP" ]; then
+    sort -t'|' -k4,4nr -k1,1 -k2,2 "$TMP" > "$TMP_SORT" || cp "$TMP" "$TMP_SORT"
+  else
+    : > "$TMP_SORT"
+  fi
 }
 
 print_menu(){
@@ -59,7 +66,7 @@ print_menu(){
     band="$(band_of_freq "${freq_digits:-0}")"
     ssid_disp=$(printf "%s" "$ssid" | cut -c1-32)
     printf "%-4s %-32s %-4s %s\n" "$i" "$ssid_disp" "$band" "$sig_digits"
-  done <"$TMP"
+  done <"$TMP_SORT"
   echo
   echo "[C] Connect (hidden SSID)   [D] Disconnect current   [R] Rescan   [Q] Quit"
   echo "Pick a number to connect (tries exact AP, falls back to SSID)."
@@ -110,7 +117,7 @@ connect_to_row(){
 # main loop
 while :; do
   scan_networks
-  if [ ! -s "$TMP" ]; then
+  if [ ! -s "$TMP_SORT" ]; then
     echo "No networks found. Rescanning…"
     nmcli device wifi rescan ifname "$IFACE" >/dev/null 2>&1 || true
     sleep 2
@@ -142,7 +149,7 @@ while :; do
       printf "Press Enter to continue…"; IFS= read -r _ ;;
     *)
       case "$choice" in *[!0-9]*|"") echo "Invalid choice."; sleep 1; continue ;; esac
-      sel="$(nl -ba "$TMP" | awk -v n="$choice" '$1==n{ $1=""; sub(/^ *\t?/,""); print; exit }')"
+      sel="$(nl -ba "$TMP_SORT" | awk -v n="$choice" '$1==n{ $1=""; sub(/^ *\t?/,""); print; exit }')"
       [ -n "${sel:-}" ] || { echo "Invalid number."; sleep 1; continue; }
       connect_to_row "$sel"
       printf "Press Enter to continue…"; IFS= read -r _ ;;
