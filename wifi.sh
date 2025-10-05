@@ -5,6 +5,7 @@
 # - Sort: SSID (A→Z), then Signal (desc) within same SSID
 # - SSID-first connect (avoids brcmfmac channel-set errors), optional BSSID fallback
 # - Explicit security profiles to avoid "key-mgmt missing" errors
+# - Silences kernel console spam (e.g., brcmfmac) during connect, then restores
 # - Exits after successful connection
 
 set -eu
@@ -25,7 +26,7 @@ SUPPORTS_ASK=0
 nmcli --help 2>/dev/null | grep -q -- '--ask' && SUPPORTS_ASK=1
 
 TRY_BSSID=1
-if command -v ethtool >/dev/null 2>&1; then
+if have ethtool; then
   if ethtool -i "$IFACE" 2>/dev/null | grep -qi 'driver: *brcmfmac'; then
     # Raspberry Pi Broadcom driver: avoid AP/channel forcing (reduces -52 spam)
     TRY_BSSID=0
@@ -34,9 +35,36 @@ fi
 
 TMP="${TMPDIR:-/tmp}/wifi_scan.$$"
 TMP_SORT="${TMPDIR:-/tmp}/wifi_scan_sorted.$$"
-trap 'rm -f "$TMP" "$TMP_SORT"' EXIT INT HUP TERM
+trap 'rm -f "$TMP" "$TMP_SORT";' EXIT INT HUP TERM
 
 sanitize_bssid(){ printf "%s" "$1" | tr -cd '0-9A-Fa-f:'; }
+
+# ---- Kernel console silencer (best-effort; requires root for full effect) ----
+SILENCE_MODE=0
+OLD_PRINTK=""
+silence_console_on(){
+  # Prefer dmesg console-off if available and root
+  if have dmesg && [ "$(id -u)" -eq 0 ] && dmesg --help 2>/dev/null | grep -q -- '--console-off'; then
+    dmesg --console-off 2>/dev/null || true
+    SILENCE_MODE=1
+    return
+  fi
+  # Fallback to lowering kernel.printk console level (root)
+  if have sysctl && [ "$(id -u)" -eq 0 ]; then
+    OLD_PRINTK="$(sysctl -n kernel.printk 2>/dev/null || echo '')"
+    # Quiet console (leave loglevel buffer intact): "1 4 1 7" is conservative
+    sysctl -q kernel.printk="1 4 1 7" 2>/dev/null && SILENCE_MODE=2
+  fi
+}
+silence_console_off(){
+  case "$SILENCE_MODE" in
+    1) dmesg --console-on 2>/dev/null || true ;;
+    2) [ -n "$OLD_PRINTK" ] && sysctl -q kernel.printk="$OLD_PRINTK" 2>/dev/null || true ;;
+  esac
+  SILENCE_MODE=0
+}
+# Ensure we restore console even on unexpected exit
+trap 'silence_console_off; rm -f "$TMP" "$TMP_SORT";' EXIT INT HUP TERM
 
 scan_networks(){
   # Include IN-USE so we can show the active row.
@@ -143,10 +171,13 @@ connect_via_profile(){
       if [ "$SUPPORTS_ASK" -eq 1 ]; then
         nmcli -w 30 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" \
           802-11-wireless-security.key-mgmt sae >/dev/null
-        nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
+        # Silence console while bringing the link up (kernel might spam)
+        silence_console_on
+        nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && { silence_console_off; return 0; }
         # Fallback to PSK for mixed WPA2/3
         nmcli connection modify "$_conn" 802-11-wireless-security.key-mgmt wpa-psk >/dev/null
-        nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
+        nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && { silence_console_off; return 0; }
+        silence_console_off
         nmcli connection delete id "$_conn" >/dev/null 2>&1 || true
         return 1
       else
@@ -158,9 +189,11 @@ connect_via_profile(){
         nmcli -w 20 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" \
           802-11-wireless-security.key-mgmt sae \
           802-11-wireless-security.psk "$_pass" >/dev/null || true
-        nmcli -w 30 connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
+        silence_console_on
+        nmcli -w 30 connection up id "$_conn" ${_bssid:+ap "$_bssid"} && { silence_console_off; return 0; }
         nmcli connection modify "$_conn" 802-11-wireless-security.key-mgmt wpa-psk >/dev/null
-        nmcli -w 30 connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
+        nmcli -w 30 connection up id "$_conn" ${_bssid:+ap "$_bssid"} && { silence_console_off; return 0; }
+        silence_console_off
         nmcli connection delete id "$_conn" >/dev/null 2>&1 || true
         return 1
       fi
@@ -173,7 +206,9 @@ connect_via_profile(){
       if [ "$SUPPORTS_ASK" -eq 1 ]; then
         nmcli -w 20 connection add type wifi ifname "$IFACE" con-name "$_conn" ssid "$_ssid" \
           802-11-wireless-security.key-mgmt wpa-psk >/dev/null
-        nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && return 0
+        silence_console_on
+        nmcli -w 45 --ask connection up id "$_conn" ${_bssid:+ap "$_bssid"} && { silence_console_off; return 0; }
+        silence_console_off
         nmcli connection delete id "$_conn" >/dev/null 2>&1 || true
         return 1
       else
@@ -189,7 +224,12 @@ connect_via_profile(){
       ;;
   esac
 
+  # Bring it up (silenced). If BSSID provided (and allowed), pass as AP hint.
+  silence_console_on
   nmcli -w 45 connection up id "$_conn" ${_bssid:+ap "$_bssid"} >/dev/null
+  rc=$?
+  silence_console_off
+  return $rc
 }
 
 connect_to_row(){
@@ -200,7 +240,7 @@ connect_to_row(){
   sbssid="$(sanitize_bssid "$bssid")"
 
   echo
-  echo "Connecting to SSID: $ssid"
+  echo "Connecting to \"$ssid\"…"
   [ "$TRY_BSSID" -eq 1 ] && [ -n "$sbssid" ] && echo "Preferred AP (BSSID): $sbssid"
 
   # 1) SSID-first with explicit profile (no AP hint)
@@ -246,7 +286,7 @@ while :; do
       if [ -n "$manual_row" ]; then
         sec_guess="$(printf "%s" "$manual_row" | awk -F'|' '{print $6}')"
       fi
-      echo "Connecting to \"$manual_ssid\" (security: $sec_guess)..."
+      echo "Connecting to \"$manual_ssid\" (security: $sec_guess)…"
       if connect_via_profile "$manual_ssid" "$sec_guess" ""; then
         echo "✅ Connected to \"$manual_ssid\"."
         exit 0
