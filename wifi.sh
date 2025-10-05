@@ -28,23 +28,35 @@ band_of_freq(){
 }
 
 sanitize_bssid(){ printf "%s" "$1" | tr -cd '0-9A-Fa-f:'; }
-
 scan_networks(){
-  # We MUST NOT split on ":" naïvely because BSSID contains colons.
-  # Use a regex: SSID : BSSID(17 chars) : FREQ(digits) : SIGNAL(digits)
+  # Fields: SSID : BSSID(6 parts) : FREQ(possibly "#### MHz") : SIGNAL
   nmcli -t -f SSID,BSSID,FREQ,SIGNAL device wifi list ifname "$IFACE" \
-  | awk '
-      match($0, /^(.*):([0-9A-Fa-f:]{17}):([0-9]+):([0-9]+)$/, m) {
-        ssid = m[1]; bssid = m[2]; freq = m[3]; signal = m[4];
-        gsub(/\\:/, ":", ssid);    # unescape literal colons in SSID
-        if (length(ssid) > 0) {
-          printf "%s|%s|%s|%s\n", ssid, bssid, freq, signal
-        }
-      }
-    ' >"$TMP"
+  | awk -F: '
+    {
+      n = NF
+      # need at least: SSID (>=1 field), BSSID(6), FREQ(1), SIGNAL(1) => 9 fields total
+      if (n < 9) next
 
-  # Sort by SIGNAL desc (numeric). keep stable order on ties by SSID then BSSID
-  # -t'|' sets delimiter; -k4,4n numeric; 'r' reverse for descending
+      signal = $n
+      freq   = $(n-1)
+
+      # Rebuild BSSID from the 6 fields before freq
+      bssid = $(n-7) ":" $(n-6) ":" $(n-5) ":" $(n-4) ":" $(n-3) ":" $(n-2)
+
+      # Rebuild SSID from everything before the BSSID
+      ssid = $1
+      for (i = 2; i <= n-8; i++) ssid = ssid ":" $i
+
+      # Unescape literal colons in SSID
+      gsub(/\\:/, ":", ssid)
+
+      if (length(ssid) > 0) {
+        printf "%s|%s|%s|%s\n", ssid, bssid, freq, signal
+      }
+    }
+  ' >"$TMP"
+
+  # Sort by SIGNAL desc; stable on ties by SSID then BSSID
   if [ -s "$TMP" ]; then
     sort -t'|' -k4,4nr -k1,1 -k2,2 "$TMP" > "$TMP_SORT" || cp "$TMP" "$TMP_SORT"
   else
