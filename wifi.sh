@@ -1,10 +1,11 @@
 #!/bin/sh
 # wifi — SSID/Band/Signal picker for terminals
 # - nmcli 1.52-safe parsing (SSIDs with colons, FREQ like "#### MHz")
-# - Shows current connection in a "Now" column
-# - Sorts by SSID (A→Z), then by Signal (desc) within the same SSID
+# - Single table: "#  Current  SSID  BAND  SIGNAL" with current indicator
+# - Sort: SSID (A→Z), then Signal (desc) within same SSID
 # - SSID-first connect (avoids brcmfmac channel-set errors), optional BSSID fallback
 # - Explicit security profiles to avoid "key-mgmt missing" errors
+# - Exits after successful connection
 
 set -eu
 export LC_ALL=C
@@ -34,16 +35,6 @@ fi
 TMP="${TMPDIR:-/tmp}/wifi_scan.$$"
 TMP_SORT="${TMPDIR:-/tmp}/wifi_scan_sorted.$$"
 trap 'rm -f "$TMP" "$TMP_SORT"' EXIT INT HUP TERM
-
-is_uint(){ case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
-
-band_of_freq(){
-  f="$1"; is_uint "$f" || { echo "?"; return; }
-  [ "$f" -ge 2400 ] && [ "$f" -le 2500 ] && { echo "2.4"; return; }
-  [ "$f" -ge 4900 ] && [ "$f" -le 5895 ] && { echo "5"; return; }
-  [ "$f" -ge 5925 ] && [ "$f" -le 7125 ] && { echo "6"; return; }
-  echo "?"
-}
 
 sanitize_bssid(){ printf "%s" "$1" | tr -cd '0-9A-Fa-f:'; }
 
@@ -86,36 +77,27 @@ scan_networks(){
 print_menu(){
   echo
   printf "Interface: %s\n\n" "$IFACE"
-  printf "%-3s %-32s %-4s %s\n" "Now" "SSID" "Band" "Signal"
-  printf "%-3s %-32s %-4s %s\n" "---" "--------------------------------" "----" "------"
-  while IFS='|' read -r inuse ssid bssid freq signal security; do
-    freq_digits=$(printf "%s" "${freq:-}"   | tr -cd '0-9')
-    sig_digits=$( printf "%s" "${signal:-}" | tr -cd '0-9')
-    [ -n "$sig_digits" ] || sig_digits="0"
-    band="$(band_of_freq "${freq_digits:-0}")"
-    ssid_disp=$(printf "%s" "$ssid" | cut -c1-32)
-    now="$( [ "$inuse" = "*" ] && printf "*" || printf " " )"
-    printf "%-3s %-32s %-4s %s\n" "$now" "$ssid_disp" "$band" "$sig_digits"
-  done <"$TMP_SORT"
-
-  echo
-  # Reprint with indices for selection (kept simple and readable)
-  echo "Pick a number to connect (SSID-first; explicit security; BSSID fallback if safe)."
-  echo
-  printf "%-4s %-32s %-4s %s\n" "#" "SSID" "Band" "Signal"
-  printf "%-4s %-32s %-4s %s\n" "----" "--------------------------------" "----" "------"
-  nl -ba "$TMP_SORT" | while IFS=$'\t' read -r idx row; do
-    IFS='|' read -r inuse ssid bssid freq signal security <<EOF
-$row
-EOF
-    freq_digits=$(printf "%s" "${freq:-}"   | tr -cd '0-9')
-    sig_digits=$( printf "%s" "${signal:-}" | tr -cd '0-9')
-    [ -n "$sig_digits" ] || sig_digits="0"
-    band="$(band_of_freq "${freq_digits:-0}")"
-    ssid_disp=$(printf "%s" "$ssid" | cut -c1-32)
-    printf "%-4s %-32s %-4s %s\n" "$idx" "$ssid_disp" "$band" "$sig_digits"
-  done
-
+  # One table: numbered, shows current indicator, SSID, band, signal
+  awk -F'|' '
+    BEGIN{
+      printf "%-4s %-8s %-32s %-4s %s\n", "#", "Current", "SSID", "BAND", "SIGNAL";
+      printf "%-4s %-8s %-32s %-4s %s\n", "----", "--------", "--------------------------------", "----", "------";
+    }
+    {
+      idx++
+      inuse = ($1=="*") ? "*" : ""
+      ssid = $2
+      freq = $4
+      signal = $5
+      gsub(/[^0-9]/,"", freq)
+      if (freq>=2400 && freq<=2500) band="2.4";
+      else if (freq>=4900 && freq<=5895) band="5";
+      else if (freq>=5925 && freq<=7125) band="6";
+      else band="?"
+      if (length(ssid)>32) ssid = substr(ssid,1,32)
+      printf "%-4d %-8s %-32s %-4s %s\n", idx, inuse, ssid, band, signal
+    }
+  ' "$TMP_SORT"
   echo
   echo "[C] Connect (hidden SSID)   [D] Disconnect current   [R] Rescan   [Q] Quit"
 }
@@ -259,7 +241,6 @@ while :; do
     c)
       printf "Enter SSID (exact): "; IFS= read -r manual_ssid
       [ -z "$manual_ssid" ] && continue
-      # Probe security for manual SSID by scanning and exact match (first hit)
       manual_row="$(grep -m1 -F "|$manual_ssid|" "$TMP_SORT" || true)"
       sec_guess="WPA2"
       if [ -n "$manual_row" ]; then
